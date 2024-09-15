@@ -11,3 +11,7 @@ Ensure you have all necessary dependencies installed:
 Run your script as usual:
 
 ```python hs.py```
+
+# Access web interface
+
+Open http://127.0.0.1:5000/ on your browser
