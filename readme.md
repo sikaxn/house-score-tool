@@ -1,6 +1,8 @@
-Under dev
+# Under dev
 
-Run the Script:
+Only tested under windows
+
+# Run the Script:
 
 Ensure you have all necessary dependencies installed:
 
