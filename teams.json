@@ -1,1 +1,1 @@
-[{"name": "Teresa", "score": 1, "color": [255, 0, 0]}, {"name": "Malala", "score": 1, "color": [0, 0, 255]}, {"name": "Mandela", "score": 1, "color": [255, 255, 0]}, {"name": "Socrates", "score": 1, "color": [0, 255, 0]}]
+[{"name": "Red", "color": [255, 0, 0], "score": 0}, {"name": "Green", "color": [0, 255, 0], "score": 0}, {"name": "Blue", "color": [0, 0, 255], "score": 0}, {"name": "Yellow", "color": [255, 255, 0], "score": 0}]

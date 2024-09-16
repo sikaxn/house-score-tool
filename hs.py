@@ -7,6 +7,7 @@ import pygame
 import multiprocessing
 import portalocker  # For file locking
 import math
+from sacn import sACNsender
 
 # Initialize teams and save to a JSON file if not present
 initial_teams = [
@@ -59,6 +60,10 @@ def index():
 
                     # Save updated teams to JSON file
                     write_teams(teams)
+
+                    # Update sACN after score adjustment
+                    update_sacn()
+
                     return redirect(url_for('index'))
                 else:
                     return "Invalid request.", 400
@@ -126,6 +131,10 @@ def config():
                     team['score'] = 0
                 # Save updated teams to JSON file
                 write_teams(teams)
+
+                # Update sACN after resetting scores
+                update_sacn()
+
                 return redirect(url_for('config'))
             except Exception as e:
                 return f"Error resetting scores: {e}", 500
@@ -210,6 +219,9 @@ def run_main_pygame():
             prev_teams = [team.copy() for team in teams]
             teams = [team.copy() for team in current_teams]
             animation_start_time = time.time()
+
+            # Update sACN when teams change
+            update_sacn()
 
         # Calculate total scores
         total_prev_score = sum([max(0, team['score']) for team in prev_teams])
@@ -511,8 +523,6 @@ def run_pie_chart_window():
 
     pygame.quit()
 
-
-
 def create_text_outline(font, message, text_color, outline_color):
     # Render the text multiple times to create an outline
     base = font.render(message, True, text_color)
@@ -544,6 +554,46 @@ def create_pie_chart_window():
     pie_chart_process = multiprocessing.Process(target=run_pie_chart_window)
     pie_chart_process.start()
     return pie_chart_process
+
+def start_sacn_sender():
+    sender = sACNsender()
+    sender.start()
+    sender.activate_output(1)
+    sender[1].multicast = False  # Set to unicast mode
+    sender[1].destination = '10.0.0.162'  # Default IP address for WLED
+    return sender
+
+def update_sacn():
+    sender = start_sacn_sender()
+    teams = read_teams()
+
+    dmx_data = [0] * 133 * 3  # Initialize DMX data for 133 pixels
+
+    # Define segments for sACN
+    segments = [
+        {'start': 1, 'stop': 36, 'color': teams[0]['color']},
+        {'start': 37, 'stop': 65, 'color': teams[1]['color']},
+        {'start': 66, 'stop': 90, 'color': teams[2]['color']},
+        {'start': 91, 'stop': 133, 'color': teams[3]['color']}
+    ]
+
+    total_score = sum([team['score'] for team in teams]) or 1  # Prevent division by zero
+    for i, segment in enumerate(segments):
+        segment_score = teams[i]['score']
+        percent_on = segment_score / total_score
+
+        if percent_on > 0.25:  # If more than 25% of the total score, turn on the whole segment
+            percent_on = 1.0
+
+        num_pixels_on = int(percent_on * (segment['stop'] - segment['start']))
+
+        for pixel in range(segment['start'] - 1, segment['start'] - 1 + num_pixels_on):
+            dmx_data[pixel * 3:pixel * 3 + 3] = segment['color']
+
+    # Send sACN data
+    sender[1].dmx_data = dmx_data
+    time.sleep(0.1)  # Wait briefly to ensure data is sent
+    sender.stop()  # Stop sender
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()  # For Windows support
