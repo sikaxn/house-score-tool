@@ -17,6 +17,9 @@ initial_teams = [
     {'name': 'Green', 'score': 0, 'color': [0, 255, 0]}
 ]
 
+# Default sACN IP address for WLED
+sacn_ip_address = '10.0.0.162'
+
 # Save initial teams to JSON file if not present
 def initialize_teams():
     try:
@@ -33,6 +36,17 @@ def read_teams():
 def write_teams(teams):
     with portalocker.Lock('teams.json', 'w', timeout=5) as f:
         json.dump(teams, f)
+
+def read_config():
+    try:
+        with portalocker.Lock('config.json', 'r', timeout=5) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {'sacn_ip': sacn_ip_address}  # Default configuration
+
+def write_config(config):
+    with portalocker.Lock('config.json', 'w', timeout=5) as f:
+        json.dump(config, f)
 
 # Flask App
 app = Flask(__name__)
@@ -110,6 +124,9 @@ def config():
     except Exception as e:
         return f"Error reading teams: {e}", 500
 
+    config = read_config()
+    current_sacn_ip = config['sacn_ip']
+
     if request.method == 'POST':
         if 'set_teams' in request.form:
             # Manually set the scores and names
@@ -138,10 +155,16 @@ def config():
                 return redirect(url_for('config'))
             except Exception as e:
                 return f"Error resetting scores: {e}", 500
+        elif 'set_sacn_ip' in request.form:
+            # Set the sACN IP address
+            new_ip = request.form.get('sacn_ip')
+            config['sacn_ip'] = new_ip
+            write_config(config)
+            return redirect(url_for('config'))
         else:
             return "Invalid request.", 400
     else:
-        # Render configuration page with current teams
+        # Render configuration page with current teams and sACN IP setting
         return render_template_string('''
             <!doctype html>
             <title>Configuration Page</title>
@@ -164,11 +187,24 @@ def config():
                 <input type="submit" value="Reset Scores">
             </form>
 
+            <h2>Set sACN IP Address:</h2>
+            <form method="post">
+                <input type="hidden" name="set_sacn_ip" value="true">
+                IP Address: <input type="text" name="sacn_ip" value="{{ current_sacn_ip }}"><br><br>
+                <input type="submit" value="Update sACN IP">
+            </form>
+
             <p><a href="{{ url_for('index') }}">Back to Main Page</a></p>
-        ''', teams=teams)
+        ''', teams=teams, current_sacn_ip=current_sacn_ip)
 
 def run_flask():
     app.run(debug=False)
+
+def create_flask_thread():
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    return flask_thread
 
 def run_main_pygame():
     pygame.init()
@@ -322,6 +358,27 @@ def run_main_pygame():
             prev_teams = [team.copy() for team in teams]
 
     pygame.quit()
+
+def create_text_outline(font, message, text_color, outline_color):
+    # Render the text multiple times to create an outline
+    base = font.render(message, True, text_color)
+    outline = pygame.Surface((base.get_width() + 2, base.get_height() + 2), pygame.SRCALPHA)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            if dx != 0 or dy != 0:
+                pos = (dx + 1, dy + 1)
+                outline.blit(font.render(message, True, outline_color), pos)
+    outline.blit(base, (1, 1))
+    return outline
+
+def create_team_windows():
+    processes = []
+    positions = [(50, 50), (400, 50), (50, 500), (400, 500)]  # Positions for windows
+    for i in range(len(initial_teams)):
+        p = multiprocessing.Process(target=run_team_window, args=(i, positions[i % len(positions)]))
+        p.start()
+        processes.append(p)
+    return processes
 
 def run_team_window(team_index, position):
     os.environ['SDL_VIDEO_WINDOW_POS'] = f"{position[0]},{position[1]}"
@@ -523,44 +580,13 @@ def run_pie_chart_window():
 
     pygame.quit()
 
-def create_text_outline(font, message, text_color, outline_color):
-    # Render the text multiple times to create an outline
-    base = font.render(message, True, text_color)
-    outline = pygame.Surface((base.get_width() + 2, base.get_height() + 2), pygame.SRCALPHA)
-    for dx in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            if dx != 0 or dy != 0:
-                pos = (dx + 1, dy + 1)
-                outline.blit(font.render(message, True, outline_color), pos)
-    outline.blit(base, (1, 1))
-    return outline
-
-def create_team_windows():
-    processes = []
-    positions = [(50, 50), (400, 50), (50, 500), (400, 500)]  # Positions for windows
-    for i in range(len(initial_teams)):
-        p = multiprocessing.Process(target=run_team_window, args=(i, positions[i % len(positions)]))
-        p.start()
-        processes.append(p)
-    return processes
-
-def create_flask_thread():
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    return flask_thread
-
-def create_pie_chart_window():
-    pie_chart_process = multiprocessing.Process(target=run_pie_chart_window)
-    pie_chart_process.start()
-    return pie_chart_process
-
 def start_sacn_sender():
+    config = read_config()
     sender = sACNsender()
     sender.start()
     sender.activate_output(1)
     sender[1].multicast = False  # Set to unicast mode
-    sender[1].destination = '10.0.0.162'  # Default IP address for WLED
+    sender[1].destination = config['sacn_ip']  # Use IP from config
     return sender
 
 def update_sacn():
@@ -582,8 +608,11 @@ def update_sacn():
         segment_score = teams[i]['score']
         percent_on = segment_score / total_score
 
-        if percent_on > 0.25:  # If more than 25% of the total score, turn on the whole segment
+        if percent_on > 0.50:  # If more than 25% of the total score, turn on the whole segment
             percent_on = 1.0
+
+        else:
+            percent_on = percent_on *2
 
         num_pixels_on = int(percent_on * (segment['stop'] - segment['start']))
 
@@ -592,7 +621,7 @@ def update_sacn():
 
     # Send sACN data
     sender[1].dmx_data = dmx_data
-    time.sleep(0.1)  # Wait briefly to ensure data is sent
+    time.sleep(0.05)  # Wait briefly to ensure data is sent
     sender.stop()  # Stop sender
 
 if __name__ == '__main__':
@@ -606,7 +635,8 @@ if __name__ == '__main__':
     team_processes = create_team_windows()
 
     # Start pie chart window in a separate process
-    pie_chart_process = create_pie_chart_window()
+    pie_chart_process = multiprocessing.Process(target=run_pie_chart_window)
+    pie_chart_process.start()
 
     # Run main Pygame app
     run_main_pygame()
