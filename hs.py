@@ -8,6 +8,8 @@ import multiprocessing
 import portalocker  # For file locking
 import math
 from sacn import sACNsender
+from gtts import gTTS  # For text-to-speech
+import tempfile  # For creating temporary files
 
 # Initialize teams and save to a JSON file if not present
 initial_teams = [
@@ -20,11 +22,28 @@ initial_teams = [
 # Default sACN IP address for WLED
 sacn_ip_address = '10.0.0.162'
 
+# Initialize sound and TTS settings
+sound_enabled = True
+tts_enabled = True
+sound_effect_file_add = 'point_add.wav'       # Make sure this file exists
+sound_effect_file_subtract = 'point_taken.wav'  # Make sure this file exists
+
+# Initialize Pygame and mixer
+pygame.init()
+pygame.mixer.init()
+
 # Save initial teams to JSON file if not present
 def initialize_teams():
     try:
         with open('teams.json', 'x') as f:
             json.dump(initial_teams, f)
+    except FileExistsError:
+        pass  # File already exists
+
+    # Initialize settings.json if not present
+    try:
+        with open('settings.json', 'x') as f:
+            json.dump({'sound_enabled': True, 'tts_enabled': True}, f)
     except FileExistsError:
         pass  # File already exists
 
@@ -48,6 +67,18 @@ def write_config(config):
     with portalocker.Lock('config.json', 'w', timeout=5) as f:
         json.dump(config, f)
 
+# Functions to read/write settings
+def read_settings():
+    try:
+        with portalocker.Lock('settings.json', 'r', timeout=5) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {'sound_enabled': True, 'tts_enabled': True}
+
+def write_settings(settings):
+    with portalocker.Lock('settings.json', 'w', timeout=5) as f:
+        json.dump(settings, f)
+
 # Flask App
 app = Flask(__name__)
 
@@ -59,6 +90,11 @@ def index():
     except Exception as e:
         return f"Error reading teams: {e}", 500
 
+    # Read settings
+    settings = read_settings()
+    sound_enabled = settings['sound_enabled']
+    tts_enabled = settings['tts_enabled']
+
     if request.method == 'POST':
         if 'adjust' in request.form:
             # Update scores based on button clicked
@@ -68,6 +104,7 @@ def index():
 
                 if action:
                     points = int(action)
+                    old_score = teams[team_index]['score']
                     teams[team_index]['score'] += points
                     if teams[team_index]['score'] < 0:
                         teams[team_index]['score'] = 0  # Prevent negative scores
@@ -78,11 +115,47 @@ def index():
                     # Update sACN after score adjustment
                     update_sacn()
 
+                    # Play sound effect if enabled
+                    if sound_enabled:
+                        play_sound_effect(points)
+
+                    # Announce score change via TTS if enabled
+                    if tts_enabled:
+                        score_change = teams[team_index]['score'] - old_score
+                        announce_score_change(teams[team_index]['name'], score_change)
+
                     return redirect(url_for('index'))
                 else:
                     return "Invalid request.", 400
             except Exception as e:
                 return f"Error updating scores: {e}", 500
+        elif 'announce_team' in request.form:
+            # Announce individual team score
+            try:
+                team_index = int(request.form.get('team_index'))
+                if tts_enabled:
+                    announce_team_score(teams[team_index])
+                return redirect(url_for('index'))
+            except Exception as e:
+                return f"Error announcing team score: {e}", 500
+        elif 'announce_all' in request.form:
+            # Announce all teams' scores
+            try:
+                if tts_enabled:
+                    announce_all_scores(teams)
+                return redirect(url_for('index'))
+            except Exception as e:
+                return f"Error announcing all scores: {e}", 500
+        elif 'toggle_sound' in request.form:
+            # Toggle sound effect setting
+            settings['sound_enabled'] = not sound_enabled
+            write_settings(settings)
+            return redirect(url_for('index'))
+        elif 'toggle_tts' in request.form:
+            # Toggle TTS setting
+            settings['tts_enabled'] = not tts_enabled
+            write_settings(settings)
+            return redirect(url_for('index'))
         else:
             return "Invalid request.", 400
     else:
@@ -108,13 +181,35 @@ def index():
                             <button name="action" value="-2">-2</button>
                             <button name="action" value="-3">-3</button>
                         </form>
+                        <!-- Announce individual team score -->
+                        <form method="post" style="display:inline;">
+                            <input type="hidden" name="team_index" value="{{ loop.index0 }}">
+                            <input type="hidden" name="announce_team" value="true">
+                            <button type="submit">Announce Score</button>
+                        </form>
                     </td>
                 </tr>
                 {% endfor %}
             </table>
 
+            <!-- Announce all scores -->
+            <form method="post">
+                <input type="hidden" name="announce_all" value="true">
+                <button type="submit">Announce All Scores</button>
+            </form>
+
+            <!-- Toggle sound and TTS -->
+            <form method="post" style="display:inline;">
+                <input type="hidden" name="toggle_sound" value="true">
+                <button type="submit">{{ 'Disable' if sound_enabled else 'Enable' }} Sound Effects</button>
+            </form>
+            <form method="post" style="display:inline;">
+                <input type="hidden" name="toggle_tts" value="true">
+                <button type="submit">{{ 'Disable' if tts_enabled else 'Enable' }} Text-to-Speech</button>
+            </form>
+
             <p><a href="{{ url_for('config') }}">Go to Configuration Page</a></p>
-        ''', teams=teams)
+        ''', teams=teams, sound_enabled=sound_enabled, tts_enabled=tts_enabled)
 
 @app.route('/config', methods=['GET', 'POST'])
 def config():
@@ -565,12 +660,9 @@ def run_pie_chart_window():
                 text_x = center_x + (radius + 30) * math.cos(math.radians((start_angle + end_angle) / 2))
                 text_y = center_y + (radius + 30) * math.sin(math.radians((start_angle + end_angle) / 2))
 
-                # Avoid placing text too close to the center if all scores are zero or very small
-                if total_score == 1 or end_angle - start_angle < 10:
-                    text_x = min(max(text_x, center_x + radius + 50), pie_window.get_width() - text_surface.get_width() - 10)
-                    text_y = min(max(text_y, 10), pie_window.get_height() - text_surface.get_height() - 10)
-
-                pie_window.blit(text_surface, (text_x, text_y))
+                # Avoid placing text too close to the edge
+                text_rect = text_surface.get_rect(center=(text_x, text_y))
+                pie_window.blit(text_surface, text_rect)
 
             # Update start angle
             start_angle = end_angle
@@ -608,11 +700,10 @@ def update_sacn():
         segment_score = teams[i]['score']
         percent_on = segment_score / total_score
 
-        if percent_on > 0.50:  # If more than 25% of the total score, turn on the whole segment
+        if percent_on > 0.50:  # If more than 50% of the total score, turn on the whole segment
             percent_on = 1.0
-
         else:
-            percent_on = percent_on *2
+            percent_on = percent_on * 2
 
         num_pixels_on = int(percent_on * (segment['stop'] - segment['start']))
 
@@ -623,6 +714,80 @@ def update_sacn():
     sender[1].dmx_data = dmx_data
     time.sleep(0.05)  # Wait briefly to ensure data is sent
     sender.stop()  # Stop sender
+
+# Function to play the appropriate sound effect
+def play_sound_effect(action):
+    try:
+        if action > 0:
+            sound = pygame.mixer.Sound(sound_effect_file_add)
+        else:
+            sound = pygame.mixer.Sound(sound_effect_file_subtract)
+        sound.play()
+        # Wait until the sound has finished playing before returning
+        while pygame.mixer.get_busy():
+            time.sleep(0.1)
+    except Exception as e:
+        print(f"Error playing sound effect: {e}")
+
+# Function to announce score change using gTTS
+def announce_score_change(team_name, score_change):
+    if score_change > 0:
+        message = f"{team_name} gained {score_change} point{'s' if score_change > 1 else ''}."
+    elif score_change < 0:
+        message = f"{team_name} lost {abs(score_change)} point{'s' if abs(score_change) > 1 else ''}."
+    else:
+        return  # No change
+
+    try:
+        # Generate speech using gTTS
+        tts = gTTS(text=message, lang='en')
+        # Save to a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
+            temp_filename = fp.name
+            tts.save(temp_filename)
+        # Play the MP3 file using pygame.mixer.music
+        pygame.mixer.music.load(temp_filename)
+        pygame.mixer.music.play()
+        # Wait until playback is finished
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+        # Delete the temporary file
+        os.remove(temp_filename)
+    except Exception as e:
+        print(f"Error with TTS: {e}")
+
+# Function to announce individual team score using gTTS
+def announce_team_score(team):
+    message = f"{team['name']} has {team['score']} point{'s' if team['score'] != 1 else ''}."
+    try:
+        tts = gTTS(text=message, lang='en')
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
+            temp_filename = fp.name
+            tts.save(temp_filename)
+        pygame.mixer.music.load(temp_filename)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+        os.remove(temp_filename)
+    except Exception as e:
+        print(f"Error with TTS: {e}")
+
+# Function to announce all team scores using gTTS
+def announce_all_scores(teams):
+    messages = [f"{team['name']} has {team['score']} point{'s' if team['score'] != 1 else ''}." for team in teams]
+    message = " ".join(messages)
+    try:
+        tts = gTTS(text=message, lang='en')
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
+            temp_filename = fp.name
+            tts.save(temp_filename)
+        pygame.mixer.music.load(temp_filename)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+        os.remove(temp_filename)
+    except Exception as e:
+        print(f"Error with TTS: {e}")
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()  # For Windows support
@@ -650,3 +815,6 @@ if __name__ == '__main__':
     # Terminate pie chart window
     pie_chart_process.terminate()
     pie_chart_process.join()
+
+    # Quit Pygame mixer
+    pygame.mixer.quit()
